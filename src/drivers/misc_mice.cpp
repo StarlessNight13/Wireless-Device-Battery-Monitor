@@ -2,9 +2,11 @@
 //  * Motospeed X6 (Realtek VID 0BDA, receivers FFE0 / FFF2, interface 4): output report B5 [06],
 //    reply report B4, byte 20 = level (+128 while charging). The cable (FFF1) reports no battery.
 //    From github.com/Jacobz888/LGSTrayBattery-MotospeedX6.
-//  * Xenta receivers (Delux M900 Pro, Attack Shark X6 / R1 / X11 / X3 Max / V3 Pro; VID 1D57): the receiver
-//    broadcasts input report 03 on usage page 000A every ~2 s: [03][model][40][state][percent],
-//    state 2 = full, 3 = charging (percent frozen). From github.com/AeonArcHQ/omarchy-delux-m900.
+//  * Xenta receivers (Delux M900 Pro, Attack Shark X8 Plus / X6 / R1 / X11 / X3 Max / V3 Pro):
+//    broadcast input report 03 on usage page 000A every ~2 s: [03][model][40][state][percent].
+//    X8 Plus model 06 reports state 02 = charging, 03 = USB / full, with a real battery percentage.
+//    See github.com/cyberps96/attack-shark-ctl (src/device.rs and src/main.rs).
+//    Other models retain the interpretation from github.com/AeonArcHQ/omarchy-delux-m900.
 //    The collection is push-only (no output or feature report), so it is opened read-only, as BatteryTray
 //    and attackshark-battery-windows do: a read/write open fails while a vendor app holds it without
 //    sharing write access. `--dump` also prints the raw frames it sends, to add models such as the
@@ -36,6 +38,7 @@
 //    github.com/HeHaoren/incott-mouse-app (docs/protocol.md) and github.com/FelixNg21/MouseBattery
 //    (battery byte layout, verified on a G23 V2 with the 522C dongle).
 #include "drivers.h"
+#include "xenta_protocol.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -93,6 +96,7 @@ void PollMotospeed(PollContext& ctx) {
 // every link-up starts with a false 100% (github.com/qu1ncky/BatteryTray, XentaReceiverProvider).
 struct XentaModel { BYTE code; const wchar_t* name; bool tens; };
 const XentaModel kXentaModels[] = {
+    { Xenta::kX8PlusCode, L"Attack Shark X8 Plus", false },
     { 0x3D, L"Delux M900 Pro", false },
     { 0x55, L"Attack Shark X11", false },
     { 0x4E, L"Attack Shark X3 Max", false },
@@ -129,6 +133,10 @@ void PollXenta(PollContext& ctx) {
                 if (fresh && got < 2 && (LONGLONG)until - (LONGLONG)GetTickCount64() <= 0) break;
                 if (l.dev->Read(r, wait) < 5) break;
                 if (r[0] != 0x03 || r[2] != 0x40) continue;
+                if (r[1] == Xenta::kX8PlusCode) {
+                    Xenta::Battery check;
+                    if (!Xenta::DecodeX8Plus(r.data(), r.size(), check)) continue;
+                }
                 l.prev = l.last;
                 l.last.assign(r.begin(), r.begin() + 5);
                 l.lastFrameAt = GetTickCount64();
@@ -146,7 +154,15 @@ void PollXenta(PollContext& ctx) {
             s.kind = DeviceKind::Mouse;
             s.via = cable ? L"USB cable" : L"2.4 GHz receiver";
             bool agreed = l.prev == l.last;
-            if (cable || st == 0x02 || st == 0x03) {
+            if (code == Xenta::kX8PlusCode) {
+                Xenta::Battery battery;
+                if (agreed && Xenta::DecodeX8Plus(l.last.data(), l.last.size(), battery)) {
+                    s.percent = battery.percent;  // X8 Plus reports the real level even when charging
+                    s.charging = cable || battery.charging;
+                } else {
+                    s.charging = cable || st == 0x02;
+                }
+            } else if (cable || st == 0x02 || st == 0x03) {
                 s.charging = true;  // the level is frozen on external power
                 if (st == 0x02 && !cable) s.percent = 100;
             } else if (agreed) {
